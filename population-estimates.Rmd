@@ -1,0 +1,344 @@
+---
+title: "Multi-scale Population Estimates"
+output:
+  html_notebook:
+    toc: yes
+    toc_float: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(fs)
+library(glue)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(purrr)
+library(sf)
+library(ggplot2)
+library(scales)
+```
+
+Create and define a folder for data 
+
+```{r}
+data_dir <- "census-pop-data"
+if(!dir.exists(data_dir)){fs::dir_create(data_dir)}
+```
+
+# Sub-county Population Data
+
+Download 2000-2010 data
+
+```{r}
+citytown_filepath <- "https://www2.census.gov/programs-surveys/popest/datasets/2000-2010/intercensal/cities/sub-est00int.csv"
+citytown_file_local <- glue::glue("{data_dir}/{basename(citytown_filepath)}")
+if(!file.exists(citytown_file_local)){
+  download.file(citytown_filepath, destfile = citytown_file_local)
+}
+```
+
+Download 2010-2018 data
+
+```{r}
+citytown_filepath2 <- "https://www2.census.gov/programs-surveys/popest/datasets/2010-2018/cities/totals/sub-est2018_all.csv"
+citytown_file2_local <- glue::glue("{data_dir}/{basename(citytown_filepath2)}")
+if(!file.exists(citytown_file2_local)){
+  download.file(citytown_filepath2, destfile = citytown_file2_local)
+  }
+```
+
+Make a function to read in and reshape 
+
+```{r}
+reshape_pop_data <- function(citytown_file_local){
+  citytown_long <- readr::read_csv(citytown_file_local) %>%
+    dplyr::group_by(SUMLEV, STATE, COUNTY, PLACE, COUSUB, NAME, STNAME) %>%
+    # convert columns to rows
+    tidyr::pivot_longer(cols = dplyr::contains(match = c("POPESTIMATE")), 
+                      names_to = "estimate", values_to = "population") %>%
+    dplyr::select(SUMLEV, STATE, COUNTY, PLACE, COUSUB, NAME, STNAME, estimate, population) %>%
+  # separate year and estimate type into separate columns 
+  dplyr::mutate(year = stringr::str_extract(estimate, "\\d+")) %>%
+  dplyr::mutate(year = as.numeric(year)) %>%
+  dplyr::select(-estimate)
+  return(citytown_long)
+}
+
+```
+
+Download population data for metropolitan and micropolitan areas
+
+```{r}
+cbsa_url <- "https://www2.census.gov/programs-surveys/popest/datasets/2010-2018/metro/totals/cbsa-est2018-alldata.csv"
+cbsa_file_local <- glue::glue("{data_dir}/{basename(cbsa_url)}")
+if(!file.exists(cbsa_file_local)){
+  download.file(cbsa_url, destfile = cbsa_file_local)
+  }
+```
+```{r}
+# read in and reshape to fit with subcounty data
+cbsa_pop <- cbsa_file_local %>%
+  readr::read_csv() %>%
+  dplyr::select(1:16) %>%
+  tidyr::pivot_longer(cols = dplyr::contains(match = c("POPESTIMATE")), 
+                      names_to = "estimate", values_to = "population") %>%
+  dplyr::mutate(year = stringr::str_extract(estimate, "\\d+")) %>%
+  dplyr::mutate(year = as.numeric(year), SUMLEV = "320") %>%
+  dplyr::mutate(STATE = NA, COUNTY = NA, PLACE = NA, COUSUB = NA, STNAME = NA) %>%
+  dplyr::select(SUMLEV, STATE, COUNTY, PLACE, COUSUB, NAME, population, year)
+```
+
+
+Make one data frame with 3 datasets combined (CBSA, 2000-2010 subcounty, 2010-2018 subcounty)
+
+```{r}
+popdata_long <- list(citytown_file_local, citytown_file2_local) %>%
+  purrr::map(~reshape_pop_data(.x)) %>% 
+  bind_rows() %>% 
+  bind_rows(cbsa_pop)
+```
+
+```{r, include=FALSE, echo=FALSE, results="asis"}
+head(popdata_long) %>% knitr::kable()
+```
+
+# Download spatial data
+
+```{r}
+# Counties
+county_shp <- glue("{data_dir}/tl_2019_us_county.shp")
+if(!file.exists(county_shp)){
+  county2019_url <- 'https://www2.census.gov/geo/tiger/TIGER2019/COUNTY/tl_2019_us_county.zip' 
+  tmp <- tempfile()
+  download.file(county2019_url, destfile = tmp)
+  unzip(zipfile = tmp, exdir = data_dir)
+}
+# Core Based Statistical Areas
+cbsa_shp <- glue("{data_dir}/tl_2019_us_cbsa.shp")
+if(!file.exists(cbsa_shp)){
+  cbsa2019_url <- 'https://www2.census.gov/geo/tiger/TIGER2019/CBSA/tl_2019_us_cbsa.zip' 
+  tmp <- tempfile()
+  download.file(cbsa2019_url, destfile = tmp)
+  unzip(zipfile = tmp, exdir = data_dir)
+}
+# Places in MD (State code 24)
+md_places_shp <- glue("{data_dir}/tl_2019_24_place.shp")
+if(!file.exists(md_places_shp)){
+  md_places_url <- 'https://www2.census.gov/geo/tiger/TIGER2019/PLACE/tl_2019_24_place.zip'
+  tmp <- tempfile()
+  download.file(md_places_url, destfile = tmp)
+  unzip(zipfile = tmp, exdir = data_dir)
+}
+# Water Areas for MD (State code 24)
+if(!any(fs::dir_ls(data_dir, recurse = TRUE, glob = "areawater"))){
+  system(glue('wget -r -np -A "tl_2019_24*_areawater.zip" ftp://ftp2.census.gov/geo/tiger/TIGER2019/AREAWATER -P {data_dir}'))
+  zipfiles <- fs::dir_ls(data_dir, recurse = TRUE, glob = "*areawater.zip")
+  purrr::walk(zipfiles, ~unzip(zipfile = .x, exdir = data_dir))
+}
+
+```
+
+# Where is SESYNC?
+
+```{r, message=FALSE}
+counties_sf <- sf::st_read(county_shp)
+counties_md <- dplyr::filter(counties_sf, STATEFP == "24")
+cbsa_sf <- sf::st_read(cbsa_shp)
+places_sf <- sf::st_read(md_places_shp)
+
+sesync <- st_sfc(st_point(
+  c(-76.503394, 38.976546)),
+  crs = st_crs(counties_sf))
+
+sesync_county_sf <- counties_sf[sesync,]
+sesync_cbsa_sf <- cbsa_sf[sesync,]
+sesync_place_sf <- places_sf[sesync,]
+
+sesync_county <- sesync_county_sf[["NAMELSAD"]] %>% as.character()
+sesync_place <- sesync_place_sf[["NAMELSAD"]] %>% as.character()
+sesync_cbsa <- sesync_cbsa_sf[["NAME"]] %>% as.character()
+
+sesync_ids <- data.frame(SUMLEV = c("050", "157", "320"),
+                         NAME = c(sesync_county, sesync_place, sesync_cbsa),
+                         stringsAsFactors = FALSE)
+```
+
+```{r, include=FALSE, echo=FALSE, results="asis"}
+knitr::kable(sesync_ids)
+```
+
+Use this info to filter the population data
+
+```{r}
+# The key for SUMLEV is as follows:
+# 040 = State
+# 050 = County
+# 061 = Minor Civil Division
+# 071 = Minor Civil Division place part
+# 157 = County place part
+# 162 = Incorporated place
+# 170 = Consolidated city
+# 172 = Consolidated city -- place within consolidated city
+# 320 = Core based statistical areas
+
+sesync_ids <- data.frame(SUMLEV = c("050", "157", "320"),
+                         NAME = c(as.character(sesync_county_sf[["NAMELSAD"]]),
+                                  as.character(sesync_place_sf[["NAMELSAD"]]),
+                                  as.character(sesync_cbsa_sf[["NAME"]])))
+sesync_pops <- popdata_long %>% 
+    dplyr::filter(SUMLEV %in% sesync_ids[["SUMLEV"]]) %>%
+    ungroup() %>% 
+    dplyr::group_split(SUMLEV) %>%
+    purrr::map(~dplyr::inner_join(.x, sesync_ids)) %>% 
+  bind_rows() %>% 
+  # get rid of Annapolis city, Missouri!
+  dplyr::filter(STATE == "24" | is.na(STATE)) 
+```
+
+# Plots 
+
+```{r}
+# pop_trends <-
+  sesync_pops %>%
+  ggplot(aes(x = year, y = population, group = NAME)) +
+  geom_line(aes(col = NAME), lwd = 2) +
+  facet_wrap(vars(NAME), scales = "free_y", ncol = 1) +
+  theme_dark() +
+  theme(legend.position = "none") +
+  xlab(element_blank()) +
+  ylab(element_blank()) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_color_manual(values = c(
+    `Baltimore-Columbia-Towson, MD` = "purple",
+    `Anne Arundel County` = "red",
+    `Annapolis city` = "black"
+  )) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Population Estimates")
+
+# ggsave("popdata.png", 
+#        pop_trends, 
+#        bg = "transparent", 
+#        width = 4.5, height = 5, units = "in")
+```
+
+# Maps
+
+```{r}
+# make list of water area polygons intersecting Maryland
+water_sfs_list <- list.files(recursive = TRUE, full.names = TRUE, pattern = "_areawater.shp$") %>%
+  purrr::map(~st_read(.x, quiet = TRUE)) %>% 
+  purrr::map(~st_union(.x)) %>%
+  purrr::map(~st_intersection(.x, counties_md))
+```
+
+```{r}
+md_map <-
+  sesync_cbsa_sf %>%
+  ggplot() +
+  geom_sf(data = counties_md, fill = "white") +
+  geom_sf(fill = "purple", alpha = 0.5, col = "purple", lwd = 2) +
+  geom_sf(data = sesync, pch = 4, col = "green") +
+  theme_minimal()  +
+  theme(axis.text = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "transparent",colour = NA),
+        plot.background = element_rect(fill = "transparent",colour = NA))
+
+for (i in 1:length(water_sfs_list)) { 
+  md_map <- md_map + geom_sf(data = water_sfs_list[[i]], fill = "dodger blue", lwd = 0)
+}
+
+md_map <- md_map + geom_sf(data = sesync_cbsa_sf, fill = NA, col = "purple", lwd = 2)
+md_map
+
+# ggsave("md.png", md_map, bg = "transparent")
+
+```
+
+```{r}
+cbsa_map <-
+  sesync_county_sf %>%
+  ggplot() +
+  geom_sf(data = counties_md, fill = "white") +
+  geom_sf(fill = "red", col = "red", lwd = 2, alpha = 0.5) +
+  geom_sf(data = sesync, pch = 4, col = "green") +
+  theme_minimal()  +
+  theme(axis.text = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "transparent",colour = NA),
+        plot.background = element_rect(fill = "transparent",colour = NA))
+
+for (i in 1:length(water_sfs_list)) { 
+  cbsa_map <- cbsa_map + geom_sf(data = water_sfs_list[[i]], fill = "dodger blue", lwd = 0)
+}
+
+cbsa_map <- cbsa_map + geom_sf(data = sesync_county_sf, fill = NA, col = "red", lwd = 2)
+cbsa_map
+# ggsave("cbsa_map..png", cbsa_map, bg = "transparent")
+```
+
+```{r, message=FALSE}
+county_bbox <- sesync_county_sf %>% st_bbox()
+
+map1 <- sesync_county_sf %>%
+  ggplot() +
+  geom_sf(fill = "white", col = "red") +
+  geom_sf(data = sesync_place_sf, fill = "black", col = "black", alpha = 0.5) +
+  geom_sf(data = sesync, pch = 4, col = "green") +
+  theme_minimal()  +
+  theme(axis.text = element_blank(),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+for (i in 1:length(water_sfs_list)) { 
+  map1 <- map1 + geom_sf(data = water_sfs_list[[i]], fill = "dodger blue", lwd = 0)
+}
+
+# aa_county <- 
+map1 +  
+  geom_sf(data = sesync_place_sf, fill = NA, col = "black", lwd = 1.5) +
+  coord_sf(xlim = c(county_bbox[1], county_bbox[3]),
+           ylim = c(county_bbox[2], county_bbox[4])) +
+  theme(panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "transparent",colour = NA),
+    plot.background = element_rect(fill = "transparent",colour = NA))
+
+# ggsave("aacounty.png", aa_county, bg = "transparent")
+```
+
+
+# Interactive map
+
+```{r}
+library(leaflet)
+
+tiger_wms_url <- "https://tigerweb.geo.census.gov/arcgis/services/TIGERweb/tigerWMS_Current/MapServer/WMSServer"
+
+leaflet() %>%
+  addProviderTiles(providers$Esri.WorldImagery) %>%
+  setView(lng = -76.5, lat = 38.97, zoom = 8) %>%
+  addWMSTiles(
+    tiger_wms_url,
+    layers = c("Metropolitan Statistical Areas",
+               "Metropolitan Statistical Areas Labels",
+               "Counties", "Counties Labels",
+               "Incorporated Places", "Incorporated Places Labels"),
+    options = WMSTileOptions(format = "image/png", transparent = TRUE)
+  )
+
+```
+
+
+
